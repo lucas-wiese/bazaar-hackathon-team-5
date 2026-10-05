@@ -1,0 +1,564 @@
+"""Offline tests for tools/duel_loop.py on small synthetic records (never the live docs/duels, which keep growing).
+The simulator is faked where the logic is the point (fast), and real with a few hundred duels end to end."""
+import json
+from pathlib import Path
+
+import pytest
+
+from agents.duelist import params as pm
+from tools import duel_loop as dl
+
+D = 0.08
+
+
+# ------------------------------------------------------------------ synthetic records
+
+def say(tick, who, price=None, days=None):
+    return {"tick": tick, "from": "you" if who == "us" else "Rival Gris", "text": "", "price": price, "days": days}
+
+
+def duel(n, *, start=100, status="no_deal", role="seller", limit=50, price=None, days=None, result=0.0, msgs=(),
+         issues=("price",), weight=None, meaning=None, decisions=()):
+    """A record as agents/duelist/records.py writes it; status None: still live (no final payload)."""
+    msgs = list(msgs)
+    ours = sum(m["from"] == "you" for m in msgs)
+    raw = {"duel": n, "session": 3, "status": "live", "role": role, "your_limit": limit, "rival": "Rival Gris",
+           "deadline_tick": start + 16, "decay_per_round": D, "issues": list(issues), "your_days_weight": weight,
+           "days_meaning": meaning, "messages": msgs, "rounds": min(ours, len(msgs) - ours)}
+    rec = {"duel": n, "session": {"session": 3, "name": "Duels II", "duel_ticks": 16, "decay": D}, "first_tick": start,
+           "view": {"role": role, "limit": limit, "duel_ticks": 16, "issues": list(issues)},
+           "payloads": [{"tick": start, "raw": raw}], "decisions": list(decisions)}
+    if status is not None:
+        rec["done"] = {**raw, "status": status, "price": price, "days": days, "result": result}
+    return rec
+
+
+def folder(tmp_path, recs, *, feed=(), scores=()):
+    f = tmp_path / "duels"
+    f.mkdir(exist_ok=True)
+    for old in f.glob("duel-*.json"):
+        old.unlink()
+    for r in recs:
+        (f / f"duel-{r['duel']}.json").write_text(json.dumps(r))
+    events = [{"id": 1, "tick": 100, "type": "duels.scheduled",
+               "payload": {"session": 3, "name": "Duels II", "duel_ticks": 16, "decay": D}}, *feed]
+    (f / "feed.jsonl").write_text("".join(json.dumps(e) + "\n" for e in events))
+    (f / "scores.jsonl").write_text("".join(json.dumps(s) + "\n" for s in scores))
+    return f
+
+
+def by_id(book):
+    return {x.id: x for x in book.duels}
+
+
+@pytest.fixture
+def src(tmp_path):
+    """The duelist's constants, as module sources (no policy.py: the code policy hasn't landed)."""
+    s = tmp_path / "duelist"
+    s.mkdir()
+    (s / "agent.py").write_text("MIN_STEP_P = 3\nMIN_STEP_SHARE = 0.05\nMAX_STEP_SHARE = 0.18\nCLOSING_TICKS = 3\n"
+                                "SILENT_FROM = 0.5\nSILENT_KEEP = 0.15  # a comment\nNOT_A_PARAM = 7\n"
+                                "def f():\n    MAX_STEP_SHARE = 0.9\n")
+    (s / "runner.py").write_text("DECIDE_LEFT = 3\nACCEPT_BY = 2\nOPEN_WAIT = 2\nHOLD_TICKS = 3\n")
+    return s
+
+
+# ------------------------------------------------------------------ waves
+
+def three(first_id, start, *, live=(), status="no_deal", same_start=False):
+    return [duel(n, start=start if same_start else start + i, status=None if n in live else status)
+            for i, n in enumerate(range(first_id, first_id + 3))]
+
+
+def test_only_closed_waves_are_picked(tmp_path):
+    recs = three(1, 100, same_start=True) + three(4, 116, live=(6,)) + [duel(7, start=130), duel(8, start=131)]
+    book = dl.load(folder(tmp_path, recs))
+    assert [(w.id, [x.id for x in w.duels], w.closed) for w in book.waves] == [
+        ("3.1", [1, 2, 3], True), ("3.2", [4, 5, 6], False), ("3.3", [7, 8], False)]
+    assert dl.pick(book.waves).id == "3.1"          # 3.2 has a live duel; 3.3 is short and the session runs on
+    assert dl.pick(book.waves, "2").id == "3.2" and dl.pick(book.waves, "3.3").id == "3.3"
+
+    recs[5] = duel(6, start=118)                    # duel 6 finishes
+    assert dl.pick(dl.load(folder(tmp_path, recs)).waves).id == "3.2"
+    over = [{"id": 9, "tick": 160, "type": "duels.finished", "payload": {"session": 3, "name": "Duels II"}}]
+    assert dl.pick(dl.load(folder(tmp_path, recs, feed=over)).waves).id == "3.3"   # the session is over
+
+
+def test_wave_size_is_the_session_max_concurrent_when_known(tmp_path):
+    recs = three(1, 100, same_start=True) + three(4, 116)
+    f = folder(tmp_path, recs)
+    lines = (f / "feed.jsonl").read_text().replace('"decay": 0.08}', '"decay": 0.08, "max_concurrent": 2}', 1)
+    (f / "feed.jsonl").write_text(lines)
+    assert [len(w.duels) for w in dl.load(f).waves] == [2, 2, 2]
+
+
+# ------------------------------------------------------------------ the summary
+
+def test_decay_lost_and_in_limit_offers_missed(tmp_path):
+    keep2 = (1 - D) ** 2
+    recs = [
+        # deal at their 70 after two rounds: the best in-limit offer is the one we took, nothing missed
+        duel(11, status="deal", price=70, result=round(20 * keep2, 1),
+             msgs=[say(100, "us", 90), say(100, "them", 60), say(101, "us", 75), say(101, "them", 70)]),
+        # no deal while their 60 sat inside our 50: 10 P x 0.92 (one round) missed
+        duel(12, msgs=[say(100, "us", 90), say(100, "them", 60)]),
+        # deal at 55 after passing their 62 (11.0 P then) for 4.2 P: 6.8 missed
+        duel(13, status="deal", price=55, result=round(5 * keep2, 1),
+             msgs=[say(100, "us", 90), say(100, "them", 62), say(101, "us", 80), say(101, "them", 55)]),
+        # their 40 was never inside our limit
+        duel(14, msgs=[say(100, "us", 90), say(100, "them", 40)]),
+    ]
+    xs = by_id(dl.load(folder(tmp_path, recs)))
+    assert xs[11].surplus == pytest.approx(20, abs=0.1)
+    assert xs[11].decay_lost == pytest.approx(20 * (1 - keep2), abs=0.1)
+    assert xs[11].missed is None and xs[14].missed is None
+    assert xs[12].missed == {"tick": 100, "price": 60, "day": None, "value": 9.2, "lost": 9.2}
+    assert xs[13].missed["price"] == 62 and xs[13].missed["lost"] == pytest.approx(6.8, abs=0.05)
+
+    obs = dl.observe(list(xs.values()))
+    assert (obs["duels"], obs["deals"], obs["deal_rate"], obs["rounds"]) == (4, 2, 0.5, 2.0)
+    assert obs["decay_lost_p"] == pytest.approx((xs[11].surplus + xs[13].surplus) * (1 - keep2), abs=0.01)
+    assert {x.id for x in obs["missed"]} == {12, 13}
+    assert obs["missed_p"] == pytest.approx(9.2 + 6.8, abs=0.05)
+    assert dl.as_json(obs)["missed"] == [12, 13]
+
+
+def test_days_settled_day_cost_and_day_bonus_in_the_limit(tmp_path):
+    recs = [
+        # buyer, 2 P a day from day 0: the deal on day 5 cost us 10 P against our best day
+        duel(21, role="buyer", limit=100, issues=("price", "days"), weight=2,
+             meaning="each delivery day costs you this much cash", status="deal", price=80, days=5,
+             result=round(10 * (1 - D), 1), msgs=[say(100, "us", 70, 0), say(100, "them", 80, 5)]),
+        # seller, a 3 P bonus a day: their 45 on day 10 is worth -5 + 30 to us, inside our limit; on day 0 it isn't
+        duel(22, role="seller", limit=50, issues=("price", "days"), weight=3,
+             meaning="each delivery day adds this much cash to your side",
+             msgs=[say(100, "us", 90, 10), say(100, "them", 45, 0), say(101, "us", 85, 10), say(101, "them", 45, 10)]),
+    ]
+    xs = by_id(dl.load(folder(tmp_path, recs)))
+    assert (xs[21].best_day, xs[21].day, xs[21].day_cost) == (0, 5, 10.0)
+    assert xs[21].surplus == pytest.approx(10, abs=0.1)
+    assert xs[22].missed["day"] == 10 and xs[22].missed["value"] == pytest.approx(25 * (1 - D) ** 2, abs=0.05)
+    obs = dl.observe(list(xs.values()))
+    assert (obs["days_deals"], obs["best_day_deals"], obs["day_cost_p"]) == (1, 0, 10.0)
+
+
+def test_share_from_a_score_jump_that_holds_one_deal_alone(tmp_path):
+    recs = [duel(n, start=90, status="deal", price=60, result=round(10 * (1 - D), 1),
+                 msgs=[say(95, "us", 70), say(95, "them", 60)]) for n in (31, 32, 33)]
+    closed = [{"id": 10 + n, "tick": t, "type": "duel.closed", "payload": {"duel": n, "status": "deal"}}
+              for n, t in ((31, 105), (32, 115), (33, 118))]
+    scores = [{"tick": 100, "duel_points": 1.0}, {"tick": None, "duel_points": 1.2},
+              {"tick": 110, "duel_points": 1.5}, {"tick": 120, "duel_points": 2.3}]
+    xs = by_id(dl.load(folder(tmp_path, recs, feed=closed, scores=scores)))
+    assert xs[31].points == pytest.approx(0.5) and xs[31].share == pytest.approx(0.5 / (1 - D), abs=0.001)
+    assert xs[32].points is None and xs[33].points is None       # two deals in one interval: no pie
+    obs = dl.observe(list(xs.values()))
+    assert obs["share_n"] == 1 and obs["score_est"] and obs["score"] == pytest.approx(0.5)
+
+
+def test_latency_counts_model_code_and_fallback_moves():
+    decisions = [
+        {"took_s": 5.0, "move": {"meta": {"calls": [{"stage": "strategist", "latency_s": 4.0},
+                                                    {"stage": "negotiator", "latency_s": 1.0}]}}},
+        {"took_s": 0.01, "hold": True, "move": {"meta": {"rule": "deadline", "calls": []}}},
+        {"took_s": 12.0, "move": {"meta": {"fallback": "timeout after 10 s", "calls": []}}},
+    ]
+    x = dl.read_duel(duel(41, decisions=decisions), {})
+    lat = dl.latency([x])
+    assert (lat["n"], lat["max"], lat["p90"], lat["model"], lat["code"], lat["fallbacks"], lat["timeouts"],
+            lat["holds"]) == (3, 12.0, 12.0, 1, 1, 1, 1, 1)
+    assert lat["stages"] == {"strategist": 4.0, "negotiator": 1.0}
+
+
+# ------------------------------------------------------------------ params -> the simulator's policy
+
+def test_defaults_are_read_from_the_module_sources(src):
+    assert dl.module_defaults(src) == {"MIN_STEP_P": 3, "MIN_STEP_SHARE": 0.05, "MAX_STEP_SHARE": 0.18,
+                                       "CLOSING_TICKS": 3, "SILENT_FROM": 0.5, "SILENT_KEEP": 0.15,
+                                       "DECIDE_LEFT": 3, "ACCEPT_BY": 2, "OPEN_WAIT": 2, "HOLD_TICKS": 3}
+
+
+def test_this_checkouts_constants_parse():
+    found = dl.module_defaults()
+    assert {"MIN_STEP_P", "MIN_STEP_SHARE", "MAX_STEP_SHARE", "SILENT_KEEP", "ACCEPT_BY", "HOLD_TICKS"} <= set(found)
+    assert all(isinstance(v, (int, float)) for v in found.values())
+
+
+def test_params_map_onto_the_sim_policy(src, tmp_path):
+    p = tmp_path / "duel_params.json"
+    p.write_text(json.dumps({"_note": "x", "MAX_STEP_SHARE": 0.25, "OPENER_SHARE_SELLER": 0.5}))
+    _, over, errors = dl.read_params(p)
+    eff = dl.effective(dl.module_defaults(src), over)
+    assert errors == [] and eff["MAX_STEP_SHARE"] == 0.25 and "OPENER_SHARE_SELLER" not in eff   # no policy.py
+    pol = dl.sim_policy(eff, days=False, code=False)
+    assert {k: pol[k] for k in ("smin", "smin_share", "cap", "end_ticks", "silent_keep", "accept_by", "hold_break",
+                                "open_wait")} == {
+        "smin": 3, "smin_share": 0.05, "cap": 0.25, "end_ticks": 3, "silent_keep": 0.15, "accept_by": 2,
+        "hold_break": 3, "open_wait": 0}                            # price only: the opener doesn't wait
+    assert pol["step"] == "llm" and pol["end_emp"] and pol["switch_any"]   # the models, as the Duel Lab models them
+    assert pol["guard_worse"] and pol["mono_end"] is None         # GUARDS on by default; no MONO_END_SHARE here
+    assert dl.sim_policy(eff, days=True, code=False)["open_wait"] == 2
+    assert dl.sim_policy({**eff, "MONO_END_SHARE": 0.25}, days=True, code=False)["mono_end"] == 0.25
+    off = dl.sim_policy({**eff, "GUARDS": 0, "MONO_END_SHARE": 0.25}, days=True, code=False)
+    assert not off["guard_worse"] and off["mono_end"] is None
+
+    (src / "policy.py").write_text("OPENER_SHARE_SELLER = 0.73\nCODE_STEP_SHARE = 0.12\nEND_STEP_SHARE = 0.5\n")
+    eff = dl.effective(dl.module_defaults(src), over)
+    code = dl.sim_policy(eff, days=False, code=True)
+    assert (code["step"], code["alpha"], code["end_alpha"], code["end_emp"]) == ("code", 0.12, 0.5, False)
+
+
+def test_a_bad_params_file_counts_as_no_overrides(tmp_path):
+    p = tmp_path / "duel_params.json"
+    p.write_text("{broken")
+    _, over, errors = dl.read_params(p)
+    assert over == {} and len(errors) == 1 and errors[0].startswith("broken JSON")
+    p.write_text(json.dumps({"MAX_STEP_SHARE": 0.2, "NOPE": 1}))      # one bad key: the whole file is ignored
+    assert dl.read_params(p)[1] == {} and dl.read_params(p)[2] == ["NOPE: unknown parameter"]
+    assert dl.read_params(tmp_path / "missing.json") == ({}, {}, [])
+
+
+def test_the_closest_world_is_picked_and_a_missing_share_drops_out():
+    preds = {"A": {"deal_rate": 0.9, "rounds": 3.0, "share": 0.6}, "B": {"deal_rate": 0.8, "rounds": 5.0, "share": 0.3}}
+    assert dl.closest({"deal_rate": 0.8, "rounds": 5.0, "share": 0.31}, preds)[0] == "B"
+    world, dist = dl.closest({"deal_rate": 0.9, "rounds": 3.5, "share": None}, preds)
+    assert world == "A" and dist["A"] == pytest.approx(0.1)
+
+
+# ------------------------------------------------------------------ the proposal (the simulator faked)
+
+DEF = {"MIN_STEP_P": 3, "MIN_STEP_SHARE": 0.05, "MAX_STEP_SHARE": 0.18, "CLOSING_TICKS": 3, "SILENT_KEEP": 0.15,
+       "ACCEPT_BY": 2, "DECIDE_LEFT": 2, "OPEN_WAIT": 2, "HOLD_TICKS": 8}
+
+
+@pytest.fixture
+def fake_sim(monkeypatch):
+    """evaluate returns the policy itself; paired looks the change up in `gains`: ((sim key, value), ...) -> (mean,
+    ci)."""
+    gains = {}
+
+    def evaluate(policy, P=None, n=0, seed=0, T=16, d=D, H="H1"):
+        return [dict(policy)]
+
+    def paired(a, b):
+        change = tuple(sorted((k, v) for k, v in b[0].items() if a[0].get(k) != v))
+        return gains.get(change, (0.0, 0.01))
+
+    monkeypatch.setattr(dl.sim, "evaluate", evaluate)
+    monkeypatch.setattr(dl.sim, "paired", paired)
+    monkeypatch.setattr(dl.sim, "RW", {"W": {}})
+    return gains
+
+
+def search(defaults=DEF, over=None):
+    over = over or {}
+    base = dl.sim_policy(dl.effective(defaults, over), days=False, code=False)
+    return dl.search(defaults, over, world="W", base_runs=[base], T=16, d=D, days=False, code=False)
+
+
+def test_only_tweaks_with_ci_above_zero_that_validate_are_proposed(fake_sim):
+    fake_sim.update({
+        (("cap", 0.21),): (0.01, 0.002),       # kept
+        (("cap", 0.15),): (-0.01, 0.002),      # worse
+        (("smin_share", 0.08),): (0.004, 0.006),     # CI spans 0
+        (("hold_break", 9),): (0.5, 0.001),          # HOLD_TICKS 9 is past its bound: never run
+        (("hold_break", 7),): (0.002, 0.001),        # kept
+        (("silent_keep", 0.1),): (0.006, 0.002),      # kept
+        (("accept_by", 3),): (0.5, 0.001),        # ACCEPT_BY 3 > DECIDE_LEFT 2: never run
+        (("cap", 0.21), ("hold_break", 7), ("silent_keep", 0.1)): (0.02, 0.003),
+    })
+    found = search()
+    rows = {(r["name"], r["to"]): r for r in found["rows"]}
+    assert [k for k, r in rows.items() if r["kept"]] == [("MAX_STEP_SHARE", 0.21), ("HOLD_TICKS", 7),
+                                                         ("SILENT_KEEP", 0.1)]
+    assert rows[("HOLD_TICKS", 9)]["why"].startswith("invalid") and rows[("HOLD_TICKS", 9)]["mean"] is None
+    assert "ACCEPT_BY 3 > DECIDE_LEFT 2" in rows[("ACCEPT_BY", 3)]["why"]
+    assert rows[("MIN_STEP_SHARE", 0.08)]["why"] == "no clear effect (CI spans 0)"
+    assert rows[("MAX_STEP_SHARE", 0.15)]["why"] == "worse (CI below 0)"
+    assert rows[("MONO_END_SHARE", None)]["why"].startswith("no default")    # not in this checkout
+    assert found["params"] == {"MAX_STEP_SHARE": 0.21, "HOLD_TICKS": 7, "SILENT_KEEP": 0.1}
+    assert found["combined"]["kept"]
+    for name, value in found["params"].items():
+        assert pm.validate({name: value})[1] == []
+
+
+def test_a_combination_that_isnt_better_falls_back_to_the_best_single_tweak(fake_sim):
+    fake_sim.update({(("cap", 0.21),): (0.01, 0.002), (("silent_keep", 0.1),): (0.006, 0.002),
+                     (("cap", 0.21), ("silent_keep", 0.1)): (0.008, 0.003)})
+    found = search()
+    assert found["params"] == {"MAX_STEP_SHARE": 0.21} and not found["combined"]["kept"]
+
+
+def test_no_change_when_nothing_clears_zero(fake_sim):
+    found = search()
+    assert found["params"] == {} and found["combined"] is None and not any(r["kept"] for r in found["rows"])
+
+
+def test_tweaks_build_on_the_files_overrides(fake_sim):
+    fake_sim.update({(("cap", 0.28),): (0.01, 0.002)})
+    found = search(over={"MAX_STEP_SHARE": 0.25})
+    assert found["params"] == {"MAX_STEP_SHARE": 0.28}
+
+
+# ------------------------------------------------------------------ approve and revert
+
+def write_proposal(tmp_path, params, base=None):
+    p = tmp_path / "proposal.json"
+    p.write_text(json.dumps({"wave": "3.6", "made_at": "2026-10-03T22:00:00", "params": params,
+                             "evidence": {} if base is None else {"base_overrides": base}}))
+    return p
+
+
+def test_approve_merges_validates_and_notes(tmp_path, src, capsys):
+    params = tmp_path / "run" / "duel_params.json"
+    params.parent.mkdir()
+    params.write_text(json.dumps({"_note": "old", "HOLD_TICKS": 4}))
+    prop = write_proposal(tmp_path, {"MAX_STEP_SHARE": 0.21, "ACCEPT_BY": 1}, base={"HOLD_TICKS": 4})
+    assert dl.approve(proposal_path=prop, params_path=params, by="Aleks", src=src) == 0
+    data = json.loads(params.read_text())
+    assert {k: v for k, v in data.items() if k != "_note"} == {"HOLD_TICKS": 4, "MAX_STEP_SHARE": 0.21, "ACCEPT_BY": 1}
+    assert "wave 3.6" in data["_note"] and "approved by Aleks" in data["_note"]
+    assert pm.validate(data)[1] == []
+    out = capsys.readouterr().out
+    assert "MAX_STEP_SHARE: default 0.18 → 0.21" in out and "ACCEPT_BY: default 2 → 1" in out
+    assert "warning" not in out
+    assert not list(params.parent.glob("*.tmp"))
+
+
+def test_approve_only_some_names(tmp_path, src):
+    params = tmp_path / "duel_params.json"
+    prop = write_proposal(tmp_path, {"MAX_STEP_SHARE": 0.21, "ACCEPT_BY": 1})
+    assert dl.approve(proposal_path=prop, params_path=params, only=["ACCEPT_BY"], by="x", src=src) == 0
+    assert {k: v for k, v in json.loads(params.read_text()).items() if k != "_note"} == {"ACCEPT_BY": 1}
+    assert dl.approve(proposal_path=prop, params_path=params, only=["HOLD_TICKS"], by="x", src=src) == 1
+
+
+@pytest.mark.parametrize("existing, change, why", [
+    ({"HOLD_TICKS": 4}, {"MAX_STEP_SHARE": 0.9}, "outside"),                          # past SPEC's bound
+    ({"MAX_STEP_SHARE": 0.1}, {"MIN_STEP_SHARE": 0.2}, "MIN_STEP_SHARE 0.2 > MAX_STEP_SHARE 0.1"),  # CROSS
+    ({"HOLD_TICKS": 4}, {"ACCEPT_BY": 2.5}, "whole number"),
+])
+def test_approve_refuses_and_writes_nothing(tmp_path, src, capsys, existing, change, why):
+    params = tmp_path / "duel_params.json"
+    params.write_text(json.dumps(existing))
+    before = params.read_text()
+    assert dl.approve(proposal_path=write_proposal(tmp_path, change), params_path=params, by="x", src=src) == 1
+    assert params.read_text() == before
+    out = capsys.readouterr().out
+    assert "refused" in out and why in out
+
+
+def test_approve_refuses_a_broken_params_file(tmp_path, src):
+    params = tmp_path / "duel_params.json"
+    params.write_text("{half")
+    assert dl.approve(proposal_path=write_proposal(tmp_path, {"ACCEPT_BY": 1}), params_path=params, src=src) == 1
+    assert params.read_text() == "{half"
+
+
+def test_approve_writes_atomically(tmp_path, src, monkeypatch):
+    params = tmp_path / "duel_params.json"
+    params.write_text(json.dumps({"HOLD_TICKS": 4}))
+    moves = []
+    real = dl.os.replace
+
+    def spy(a, b):
+        moves.append((str(a), str(b)))
+        real(a, b)
+
+    monkeypatch.setattr(dl.os, "replace", spy)
+    assert dl.approve(proposal_path=write_proposal(tmp_path, {"ACCEPT_BY": 1}), params_path=params, src=src) == 0
+    assert moves == [(str(params) + ".tmp", str(params))]
+
+    def crash(a, b):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(dl.os, "replace", crash)
+    before = params.read_text()
+    with pytest.raises(OSError):
+        dl.approve(proposal_path=write_proposal(tmp_path, {"ACCEPT_BY": 3}), params_path=params, src=src)
+    assert params.read_text() == before                 # the duelist never sees a half-written file
+
+
+def test_approve_from_the_markdown_and_with_nothing_proposed(tmp_path, src, capsys):
+    md = tmp_path / "duel-loop.md"
+    md.write_text('# Duel loop\n\n## wave\n```json\n{"wave": "3.7", "params": {"SILENT_KEEP": 0.1}}\n```\n'
+                  '## older\n```json\n{"wave": "3.6", "params": {"ACCEPT_BY": 1}}\n```\n')
+    params = tmp_path / "duel_params.json"
+    assert dl.approve(proposal_path=md, params_path=params, by="x", src=src) == 0
+    assert {k: v for k, v in json.loads(params.read_text()).items() if k != "_note"} == {"SILENT_KEEP": 0.1}
+    md.write_text('# Duel loop\n\n## wave 3.8\n**Proposal:** no change proposed.\n'
+                  '## wave 3.7\n```json\n{"wave": "3.7", "params": {"ACCEPT_BY": 1}}\n```\n')
+    before = params.read_text()
+    assert dl.approve(proposal_path=md, params_path=params, by="x", src=src) == 1     # never an older, stale block
+    assert params.read_text() == before
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    assert dl.approve(proposal_path=write_proposal(empty, {}), params_path=empty / "p.json", src=src) == 0
+    assert not (empty / "p.json").exists() and "nothing to approve" in capsys.readouterr().out
+
+
+def test_revert_deletes_the_overrides(tmp_path, src, capsys):
+    params = tmp_path / "duel_params.json"
+    params.write_text(json.dumps({"_note": "wave 3.6", "MAX_STEP_SHARE": 0.21}))
+    assert dl.revert(params_path=params, by="Aleks", src=src) == 0
+    data = json.loads(params.read_text())
+    assert list(data) == ["_note"] and "reverted to defaults by Aleks" in data["_note"]
+    assert pm.validate(data) == ({}, [])
+    assert "MAX_STEP_SHARE: 0.21 → default 0.18" in capsys.readouterr().out
+    assert dl.revert(params_path=tmp_path / "none.json", src=src) == 0 and not (tmp_path / "none.json").exists()
+
+
+# ------------------------------------------------------------------ run and watch, end to end (the real simulator)
+
+def closed_wave(first_id, start):
+    return [duel(n, start=start, status="deal", price=60 + i, result=round((10 + i) * (1 - D) ** 2, 1),
+                 msgs=[say(start + 1, "us", 90), say(start + 1, "them", 55), say(start + 2, "us", 70),
+                       say(start + 2, "them", 60 + i)]) for i, n in enumerate(range(first_id, first_id + 3))]
+
+
+def test_run_writes_the_review_and_the_proposal(tmp_path, src):
+    f = folder(tmp_path, closed_wave(1, 100) + three(4, 116, live=(6,)))
+    out, prop = tmp_path / "intel" / "duel-loop.md", tmp_path / "run" / "proposal.json"
+    kw = dict(records=f, params_path=tmp_path / "none.json", n=200, out=out, proposal_path=prop, src=src, quiet=True,
+              target=None)                                       # any session (the target filter: its own test)
+    assert dl.run(dry=True, **kw)["wave"] == "3.1"
+    assert not out.exists() and not prop.exists()                   # --dry writes nothing
+    p = dl.run(**kw)
+    assert p["wave"] == "3.1" and set(p) == {"wave", "label", "made_at", "params", "evidence"}
+    assert p["evidence"]["world"] in dl.sim.RW and p["evidence"]["observed"]["deals"] == 3
+    assert json.loads(prop.read_text())["wave"] == "3.1"
+    for name, value in p["params"].items():
+        assert pm.validate({name: value})[1] == []
+    dl.run(**kw)                                                     # the same wave again replaces its section
+    text = out.read_text()
+    assert text.startswith("# Duel loop") and text.count("<!-- wave 3.1 -->") == 1
+    assert "| 1 | seller |" in text and "Closest world" in text
+    assert dl.run(which="3.2", **kw) is None                         # not closed
+
+
+def test_watch_handles_each_closed_wave_once(tmp_path, src):
+    state = tmp_path / "run" / "state.json"
+    kw = dict(params_path=tmp_path / "none.json", n=100, out=tmp_path / "loop.md",
+              proposal_path=tmp_path / "proposal.json", src=src)
+    recs = closed_wave(1, 100) + three(4, 116, live=(6,))
+    line = dl.watch_once(state, records=folder(tmp_path, recs), **kw)
+    assert line and "wave 3.1" in line and "closest world" in line
+    assert json.loads(state.read_text())["last_wave"] == "3.1"
+    assert dl.watch_once(state, records=folder(tmp_path, recs), **kw) is None
+    recs = closed_wave(1, 100) + closed_wave(4, 116)
+    assert "wave 3.2" in dl.watch_once(state, records=folder(tmp_path, recs), **kw)
+
+
+def test_a_blocked_move_shows_its_gain_but_is_never_proposed(fake_sim):
+    fake_sim.update({(("accept_by", 1),): (0.05, 0.002)})     # ACCEPT_BY 2 -> 1 wins big in the sim
+    found = search()
+    row = next(r for r in found["rows"] if r["name"] == "ACCEPT_BY" and r["to"] == 1)
+    assert row["mean"] == 0.05 and not row["kept"] and row["why"].startswith("CI above 0, but blocked")
+    assert "ACCEPT_BY" not in found["params"]
+
+
+def gate_record(folder, n, *, session=4, status="deal", rounds=2, spoke=True):
+    D = {"id": n, "session": session, "status": status, "deadline_tick": 100 + n, "rounds": rounds, "result": 3.0,
+         "messages": [{"from": "Rival Luna" if spoke else "Team 5", "text": "x"}]}
+    (folder / f"duel-{n}.json").write_text(json.dumps({"duel": n, "done": D}))
+
+
+def test_the_switch_rule_reports_hold_and_switch(tmp_path):
+    for i in range(12):                                         # 7 deals of 12 rivals that spoke: 0.58 < 0.60
+        gate_record(tmp_path, i, status="deal" if i < 7 else "no_deal")
+    gate_record(tmp_path, 50, session=3)                        # another session: not counted
+    g = dl.gate(tmp_path, 4)
+    assert g["verdict"] == "SWITCH" and g["evidence"]["rival_spoke"] == 12 and g["diff"] == {}
+    gate_record(tmp_path, 11)                                   # 8 of 12: 0.67
+    assert dl.gate(tmp_path, 4)["verdict"] == "HOLD"
+    assert dl.gate(tmp_path, 9)["reason"].startswith("fewer than 12")
+
+
+SETS = {"_default": "A", "_switch": {"C": "A", "A": "today"},
+        "today": {"MIN_STEP_P": 3, "MAX_STEP_SHARE": 0.25, "LATE_SWITCH_LEFT": 4, "OPEN_WAIT": 2, "MONO_END_SHARE": 0.25},
+        "A": {"MIN_STEP_P": 5, "MAX_STEP_SHARE": 0.18, "LATE_SWITCH_LEFT": 2, "OPEN_WAIT": 2, "MONO_END_SHARE": 0.25},
+        "C": {"MIN_STEP_P": 8, "MAX_STEP_SHARE": 0.12, "LATE_SWITCH_LEFT": 0, "OPEN_WAIT": 0, "MONO_END_SHARE": 0.25}}
+
+
+def test_use_writes_a_whole_set_and_nothing_of_the_old_one_remains(tmp_path, src):
+    sets, params = tmp_path / "sets.json", tmp_path / "duel_params.json"
+    sets.write_text(json.dumps(SETS))
+    assert dl.use("C", sets_path=sets, params_path=params, by="Aleks", src=src) == 0
+    assert json.loads(params.read_text())["OPEN_WAIT"] == 0
+    assert dl.use("A", sets_path=sets, params_path=params, by="Aleks", src=src) == 0
+    data = json.loads(params.read_text())
+    assert data["_set"] == "A" and {k: v for k, v in data.items() if not k.startswith("_")} == SETS["A"]
+    assert dl.use("B", sets_path=sets, params_path=params, src=src) == 1           # no such set
+    sets.write_text(json.dumps({**SETS, "bad": {"MIN_STEP_P": 99}}))
+    assert dl.use("A", sets_path=sets, params_path=params, src=src) == 1           # a broken sets file: nothing
+    assert json.loads(params.read_text())["_set"] == "A"
+
+
+def test_the_repo_sets_file_is_valid_and_its_sets_list_the_same_keys():
+    sets, default, switch, errors = dl.pm.load_sets(dl.pm.SETS)
+    assert errors == [] and default in sets and set(sets) == {"today", "A", "C"} and switch == {"C": "A"}   # Lab SUNDAY v2: one step
+
+
+def test_switch_applies_the_fallback_once_and_never_back(tmp_path, src, monkeypatch):
+    sets, params, state = tmp_path / "sets.json", tmp_path / "duel_params.json", tmp_path / "state.json"
+    sets.write_text(json.dumps(SETS))
+    dl.use("C", sets_path=sets, params_path=params, by="Aleks", src=src)
+    waves = iter(["4.3", "4.4", "4.5"])
+    monkeypatch.setattr(dl, "load", lambda *a, **k: dl.Book([], [], {}))
+    monkeypatch.setattr(dl, "pick", lambda w, which: type("W", (), {"id": next(waves), "closed": True, "session": 4})())
+    monkeypatch.setattr(dl, "session_params", lambda book, wave: (12, 0.10))
+    verdict = {"v": "SWITCH"}
+    monkeypatch.setattr(dl, "gate", lambda rec, s, eff=None: {"verdict": verdict["v"], "reason": "deal rate 0.50",
+                                                              "evidence": {"n": 12}, "diff": {}})
+    kw = dict(records=tmp_path, sets_path=sets, params_path=params, state_path=state, off=tmp_path / "off",
+              src=src, log=tmp_path / "loop.md")
+    line = dl.switch_once(**kw)
+    assert "SWITCHED C → A" in line and json.loads(params.read_text())["_set"] == "A"
+    (tmp_path / "off").write_text("")                             # the kill switch: reported, not applied
+    assert "NOT applied" in dl.switch_once(**kw) and json.loads(params.read_text())["_set"] == "A"
+    (tmp_path / "off").unlink()
+    params.write_text(json.dumps({"MIN_STEP_P": 6}))              # not an approved set: a human decides
+    assert "nothing written" in dl.switch_once(**kw)
+
+
+def test_the_switch_stops_at_a(tmp_path, src, monkeypatch):
+    """Lab SUNDAY v2: C → A is the only step; on A a SWITCH verdict writes nothing."""
+    sets, params, state = tmp_path / "sets.json", tmp_path / "duel_params.json", tmp_path / "state.json"
+    sets.write_text(json.dumps({**SETS, "_switch": {"C": "A"}}))
+    dl.use("A", sets_path=sets, params_path=params, by="Aleks", src=src)
+    monkeypatch.setattr(dl, "load", lambda *a, **k: dl.Book([], [], {}))
+    monkeypatch.setattr(dl, "pick", lambda w, which: type("W", (), {"id": "4.3", "closed": True, "session": 4})())
+    monkeypatch.setattr(dl, "session_params", lambda book, wave: (12, 0.10))
+    monkeypatch.setattr(dl, "gate", lambda rec, s, eff=None: {"verdict": "SWITCH", "reason": "deal rate 0.50",
+                                                              "evidence": {"n": 12}, "diff": {}})
+    line = dl.switch_once(records=tmp_path, sets_path=sets, params_path=params, state_path=state,
+                          off=tmp_path / "off", src=src, log=tmp_path / "loop.md")
+    assert "last step" in line and "nothing written" in line and json.loads(params.read_text())["_set"] == "A"
+
+
+def test_the_sunday_script_stop_starts_nothing():
+    text = (Path(dl.__file__).parent / "duelist_sunday.sh").read_text()
+    branch = [ln for ln in text.splitlines() if ln.strip().startswith("--stop)")]
+    assert len(branch) == 1 and "stop_all" in branch[0] and "exit 0" in branch[0] and "start_in" not in branch[0]
+
+
+def test_a_session_off_the_simulated_setting_proposes_nothing(tmp_path, src, monkeypatch):
+    f = folder(tmp_path, closed_wave(1, 100))                    # the folder's session: 16 ticks at D
+    monkeypatch.setattr(dl, "search", lambda *a, **k: {"rows": [], "combined": None,
+                                                      "params": {"MAX_STEP_SHARE": 0.15}})   # a tweak that would win
+    kw = dict(records=f, params_path=tmp_path / "none.json", n=50, out=tmp_path / "o.md",
+              proposal_path=tmp_path / "p.json", src=src, quiet=True, dry=True)
+    assert dl.run(**kw, target=(16, D))["params"] == {"MAX_STEP_SHARE": 0.15}
+    p = dl.run(**kw, target=(12, 0.10))
+    assert p["params"] == {} and "not proposed" in p["evidence"]["gates"]["reason"]
+
+
+def test_the_sunday_script_refuses_before_touching_anything_and_rollback_checks_before_stopping():
+    """Re-audit R1/R2: the one-duelist check runs before the checkout and the params rewrite; --rollback checks main
+    first, stops only then, and starts main's duelist without --records (main's `run` has no such flag)."""
+    text = (Path(dl.__file__).parent / "duelist_sunday.sh").read_text()
+    body = text[text.index('case "${1:-start}" in'):]
+    assert body.index("1/6 one duelist per machine") < body.index("git -C \"$WT\" checkout") < body.index('use "$SET"')
+    rb = body[body.index("--rollback)"):body.index("start|\"\"|--check)")]
+    assert rb.index("diff --quiet origin/main") < rb.index("pytest") < rb.index("stop_all") < rb.index("start_in")
+    assert 'start_in "$MAIN" "" $OLD_FLAGS' in rb and "pull -q" not in rb and "--records" not in rb.split("start_in")[-1]
