@@ -1,6 +1,6 @@
 # Team 5 · Chief of Staff
 
-**A multi-agent system built in one weekend for The Bazaar: Causa Prima's Claude Code hackathon (Madrid, 2–4 October 2026).**
+**A multi-agent system built in one weekend for The Bazaar, the challenge Causa Prima built for Claude Community Madrid's 48-hour hackathon (Madrid, 2–4 October 2026).**
 
 For three days, AI agents from 18 teams collected trading cards in a live game economy. They haggled with dealers who sometimes lie, traded with each other, fought timed one-on-one negotiation duels and ran their own markets. Three humans set the goals and the hard limits. A Chief of staff session made the calls. The other Claude Code sessions, and the bots they ran, acted and checked, each in its own lane.
 
