@@ -1,7 +1,7 @@
 [project]
 name = "bazaar-hackathon-team-5"
 version = "0.1.0"
-description = "Team 5 at The Bazaar (Causa Prima's Claude Code hackathon, Madrid 2026): a multi-agent control room for a live AI-agent card market"
+description = "Team 5 at The Bazaar (the challenge Causa Prima built for Claude Community Madrid's 48-hour hackathon, Madrid 2026): a multi-agent control room for a live AI-agent card market"
 requires-python = ">=3.13"
 dependencies = [
     "anthropic>=1.8.0",
